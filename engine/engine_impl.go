@@ -6,9 +6,9 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/drone-runners/drone-runner-kube/internal/docker/image"
 	"github.com/drone/runner-go/livelog"
@@ -16,7 +16,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -24,15 +25,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	watchtools "k8s.io/client-go/tools/watch"
-	"k8s.io/client-go/util/retry"
 )
-
-var backoff = wait.Backoff{
-	Steps:    5,
-	Duration: 500 * time.Millisecond,
-	Factor:   1.0,
-	Jitter:   0.1,
-}
 
 // Kubernetes implements a Kubernetes pipeline engine.
 type Kubernetes struct {
@@ -245,27 +238,39 @@ func (k *Kubernetes) tail(ctx context.Context, spec *Spec, step *Step, output io
 }
 
 func (k *Kubernetes) start(spec *Spec, step *Step) error {
-	err := retry.RetryOnConflict(backoff, func() error {
-		pod, err := k.client.CoreV1().Pods(spec.PodSpec.Namespace).Get(spec.PodSpec.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
+	orig, err := k.client.CoreV1().Pods(spec.PodSpec.Namespace).Get(spec.PodSpec.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	updated := orig.DeepCopy()
 
-		for i, container := range pod.Spec.Containers {
-			if container.Name == step.ID {
-				pod.Spec.Containers[i].Image = step.Image
-				if pod.ObjectMeta.Annotations == nil {
-					pod.ObjectMeta.Annotations = map[string]string{}
-				}
-				for _, env := range statusesWhiteList {
-					pod.ObjectMeta.Annotations[env] = step.Envs[env]
-				}
+	for i, container := range updated.Spec.Containers {
+		if container.Name == step.ID {
+			updated.Spec.Containers[i].Image = step.Image
+			if updated.ObjectMeta.Annotations == nil {
+				updated.ObjectMeta.Annotations = map[string]string{}
+			}
+			for _, env := range statusesWhiteList {
+				updated.ObjectMeta.Annotations[env] = step.Envs[env]
 			}
 		}
+	}
 
-		_, err = k.client.CoreV1().Pods(spec.PodSpec.Namespace).Update(pod)
+	origJson, err := json.Marshal(orig)
+	if err != nil {
 		return err
-	})
+	}
 
+	updatedJson, err := json.Marshal(updated)
+	if err != nil {
+		return err
+	}
+
+	patch, err := strategicpatch.CreateTwoWayMergePatch(origJson, updatedJson, v1.Pod{})
+	if err != nil {
+		return  err
+	}
+
+	_, err = k.client.CoreV1().Pods(spec.PodSpec.Namespace).Patch(orig.Name, types.StrategicMergePatchType, patch)
 	return err
 }
